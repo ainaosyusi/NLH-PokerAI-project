@@ -4,6 +4,7 @@ This module provides:
 1. RESTful API for game state
 2. WebSocket for real-time updates
 3. Simple HTML/JS frontend
+4. HUD-style personality statistics display (Phase 4)
 """
 
 import os
@@ -30,6 +31,21 @@ except ImportError:
     RuleBasedAgent = None
     PersonalityType = None
 
+try:
+    from brain.personality_analysis import (
+        OpponentModel,
+        HandTracker,
+        PlayerStatistics,
+        ActionType,
+        Street,
+        action_id_to_type,
+    )
+    PERSONALITY_TRACKING_AVAILABLE = True
+except ImportError:
+    PERSONALITY_TRACKING_AVAILABLE = False
+    OpponentModel = None
+    HandTracker = None
+
 
 # Pydantic models for API
 class GameConfig(BaseModel):
@@ -47,7 +63,7 @@ class ActionRequest(BaseModel):
 
 # Game session management
 class GameSession:
-    """Manages a single game session."""
+    """Manages a single game session with personality tracking."""
 
     def __init__(self, session_id: str, config: GameConfig):
         self.session_id = session_id
@@ -65,11 +81,24 @@ class GameSession:
         self.ai_agents: Dict[int, RuleBasedAgent] = {}
         self.ai_names: Dict[int, str] = {}
 
+        # Phase 4: Personality tracking
+        self.opponent_model = OpponentModel() if PERSONALITY_TRACKING_AVAILABLE else None
+        self.hand_tracker: Optional[HandTracker] = None
+        self.current_street = Street.PREFLOP if PERSONALITY_TRACKING_AVAILABLE else None
+        self.player_ids: Dict[int, str] = {}  # seat -> player_id string
+
         self._setup_ai()
 
     def _setup_ai(self):
         """Setup AI opponents."""
+        # Setup player IDs for personality tracking
+        self.player_ids[self.human_seat] = "You"
+
         if RuleBasedAgent is None:
+            for seat in range(self.config.num_players):
+                if seat != self.human_seat:
+                    self.player_ids[seat] = f"AI_{seat}"
+                    self.ai_names[seat] = f"AI {seat}"
             return
 
         personalities = [
@@ -97,11 +126,21 @@ class GameSession:
             )
             self.ai_agents[seat] = agent
             self.ai_names[seat] = personality.value.upper()
+            self.player_ids[seat] = f"{personality.value.upper()}_{seat}"
 
     def start_hand(self) -> Dict:
         """Start a new hand."""
         self.hand_number += 1
         self.current_obs = self.env.reset()
+
+        # Initialize hand tracker for personality analysis
+        if self.opponent_model and PERSONALITY_TRACKING_AVAILABLE:
+            self.hand_tracker = HandTracker(self.hand_number, self.config.num_players)
+            player_ids_list = [self.player_ids.get(i, f"Player_{i}") for i in range(self.config.num_players)]
+            positions = list(range(self.config.num_players))
+            self.hand_tracker.start_hand(player_ids_list, positions)
+            self.current_street = Street.PREFLOP
+
         return self._get_state()
 
     def _parse_cards(self, cards) -> List[Dict]:
@@ -126,7 +165,7 @@ class GameSession:
         """Get current game state as dict."""
         obs = self.current_obs
 
-        return {
+        state = {
             "session_id": self.session_id,
             "hand_number": self.hand_number,
             "street": obs.get("street", 0),
@@ -147,6 +186,77 @@ class GameSession:
             "ai_names": self.ai_names,
         }
 
+        # Add personality stats for each player
+        if self.opponent_model:
+            player_stats = {}
+            for seat in range(self.config.num_players):
+                player_id = self.player_ids.get(seat, f"Player_{seat}")
+                stats = self.opponent_model.get_player_stats(player_id)
+                if stats and stats.hands_played > 0:
+                    player_stats[seat] = {
+                        "vpip": round(stats.vpip * 100, 1),
+                        "pfr": round(stats.pfr * 100, 1),
+                        "af": round(stats.aggression_factor, 1) if stats.aggression_factor != float('inf') else 99.9,
+                        "hands": stats.hands_played,
+                        "personality": stats.personality.value,
+                        "confidence": round(stats.personality_confidence * 100, 0),
+                        "three_bet": round(stats.three_bet_pct * 100, 1),
+                        "cbet": round(stats.cbet_pct * 100, 1),
+                        "wtsd": round(stats.wtsd * 100, 1),
+                        "wsd": round(stats.wsd * 100, 1),
+                        "bb_per_100": round(stats.bb_per_100, 1),
+                    }
+                else:
+                    player_stats[seat] = None
+            state["player_stats"] = player_stats
+
+        return state
+
+    def _track_action(self, seat: int, action: int):
+        """Track an action for personality analysis."""
+        if not self.hand_tracker or not PERSONALITY_TRACKING_AVAILABLE:
+            return
+
+        player_id = self.player_ids.get(seat, f"Player_{seat}")
+        is_facing_bet = self.current_obs.get("to_call", 0) > 0
+        action_type = action_id_to_type(action, is_facing_bet)
+        pot_size = self.current_obs.get("pot", 0)
+
+        # Check for street change
+        street_idx = self.current_obs.get("street", 0)
+        new_street = Street(street_idx) if street_idx < 4 else Street.RIVER
+        if new_street != self.current_street:
+            self.hand_tracker.advance_street(new_street)
+            self.current_street = new_street
+
+        self.hand_tracker.record_action(
+            player_id,
+            action_type,
+            pot_size=pot_size,
+            is_facing_bet=is_facing_bet,
+        )
+
+    def _finalize_hand(self, rewards: List[float]):
+        """Finalize hand tracking and record results."""
+        if not self.hand_tracker or not self.opponent_model:
+            return
+
+        # Determine winners
+        winner_ids = []
+        hand_profits = {}
+        for seat in range(self.config.num_players):
+            player_id = self.player_ids.get(seat, f"Player_{seat}")
+            profit = rewards[seat] if seat < len(rewards) else 0
+            hand_profits[player_id] = profit
+            if profit > 0:
+                winner_ids.append(player_id)
+
+        went_to_showdown = self.current_obs.get("street", 0) >= 3
+
+        results = self.hand_tracker.end_hand(winner_ids, hand_profits, went_to_showdown)
+        self.opponent_model.record_hand(results)
+        self.hand_tracker = None
+
     def process_action(self, action: int, amount: int = 0) -> Dict:
         """Process a player action.
 
@@ -163,6 +273,8 @@ class GameSession:
 
         # If it's human's turn, use provided action
         if current_player == self.human_seat:
+            # Track human action
+            self._track_action(self.human_seat, action)
             self.current_obs, rewards, done, _, info = self.env.step(action)
         else:
             # AI turn - this shouldn't happen via API
@@ -185,11 +297,14 @@ class GameSession:
                 import random
                 ai_action = random.choice(valid)
 
+            # Track AI action
+            self._track_action(current, ai_action)
             self.current_obs, rewards, done, _, info = self.env.step(ai_action)
 
         # Check if hand ended
         if self.current_obs.get("is_terminal", False):
             self.total_profit += rewards[self.human_seat]
+            self._finalize_hand(rewards)
 
         return self._get_state()
 
@@ -290,6 +405,45 @@ HTML_TEMPLATE = """
         .player .bet { color: #ffd700; font-size: 0.9em; }
         .player .cards { display: flex; justify-content: center; gap: 5px; margin-top: 10px; }
         .player .cards .card { width: 40px; height: 56px; font-size: 0.9em; }
+
+        /* HUD Statistics Display */
+        .player .hud {
+            margin-top: 8px;
+            padding: 6px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            font-size: 0.75em;
+            font-family: 'Courier New', monospace;
+        }
+        .player .hud .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 2px 0;
+        }
+        .player .hud .stat-label {
+            color: #aaa;
+        }
+        .player .hud .stat-value {
+            color: #fff;
+            font-weight: bold;
+        }
+        .player .hud .stat-value.high { color: #f44336; }
+        .player .hud .stat-value.medium { color: #ffc107; }
+        .player .hud .stat-value.low { color: #4caf50; }
+        .player .hud .personality {
+            text-align: center;
+            margin-top: 4px;
+            padding-top: 4px;
+            border-top: 1px solid rgba(255,255,255,0.2);
+            color: #64b5f6;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .player .hud .hands-count {
+            text-align: center;
+            color: #888;
+            font-size: 0.9em;
+        }
 
         @keyframes pulse {
             0%, 100% { box-shadow: 0 0 5px #4caf50; }
@@ -436,6 +590,49 @@ HTML_TEMPLATE = """
             return `<div class="card ${suitClass}">${rank}${suit}</div>`;
         }
 
+        function getStatClass(value, lowThresh, highThresh) {
+            if (value >= highThresh) return 'high';
+            if (value >= lowThresh) return 'medium';
+            return 'low';
+        }
+
+        function formatHUD(stats) {
+            if (!stats || stats.hands < 5) {
+                return '<div class="hud"><div class="hands-count">Collecting data...</div></div>';
+            }
+
+            const vpipClass = getStatClass(stats.vpip, 25, 40);
+            const pfrClass = getStatClass(stats.pfr, 15, 25);
+            const afClass = getStatClass(stats.af, 2, 3.5);
+
+            return `
+                <div class="hud">
+                    <div class="stat-row">
+                        <span class="stat-label">VPIP:</span>
+                        <span class="stat-value ${vpipClass}">${stats.vpip}%</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">PFR:</span>
+                        <span class="stat-value ${pfrClass}">${stats.pfr}%</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">AF:</span>
+                        <span class="stat-value ${afClass}">${stats.af}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">3B:</span>
+                        <span class="stat-value">${stats.three_bet}%</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">WTSD:</span>
+                        <span class="stat-value">${stats.wtsd}%</span>
+                    </div>
+                    <div class="personality">${stats.personality}</div>
+                    <div class="hands-count">${stats.hands} hands</div>
+                </div>
+            `;
+        }
+
         async function startGame() {
             const response = await fetch('/api/game/start', {
                 method: 'POST',
@@ -536,6 +733,10 @@ HTML_TEMPLATE = """
                 const name = isHuman ? 'You' : (gameState.ai_names[i] || `Player ${i}`);
                 const cards = isHuman ? gameState.hole_cards : [{}, {}];
 
+                // Get player stats for HUD
+                const stats = gameState.player_stats ? gameState.player_stats[i] : null;
+                const hudHTML = !isHuman ? formatHUD(stats) : '';
+
                 playersHTML += `
                     <div class="${classes}">
                         <div class="name">${name}</div>
@@ -545,6 +746,7 @@ HTML_TEMPLATE = """
                             ${formatCard(cards[0], !isHuman && isActive)}
                             ${formatCard(cards[1], !isHuman && isActive)}
                         </div>
+                        ${hudHTML}
                     </div>
                 `;
             }
@@ -616,8 +818,14 @@ async def new_hand(session_id: str):
             valid = [i for i, v in enumerate(mask) if v]
             ai_action = random.choice(valid)
 
+        # Track AI action for personality analysis
+        session._track_action(current, ai_action)
         session.current_obs, rewards, done, _, info = session.env.step(ai_action)
         state = session._get_state()
+
+        # If hand ended during AI actions
+        if state["is_terminal"]:
+            session._finalize_hand(rewards)
 
     return state
 
@@ -643,6 +851,49 @@ async def get_state(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     return sessions[session_id]._get_state()
+
+
+@app.get("/api/game/{session_id}/stats")
+async def get_player_stats(session_id: str):
+    """Get detailed personality statistics for all players."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    if not session.opponent_model:
+        return {"error": "Personality tracking not available"}
+
+    stats = {}
+    for seat in range(session.config.num_players):
+        player_id = session.player_ids.get(seat, f"Player_{seat}")
+        player_stats = session.opponent_model.get_player_stats(player_id)
+        if player_stats:
+            stats[seat] = player_stats.to_dict()
+
+    return {"session_id": session_id, "player_stats": stats}
+
+
+@app.get("/api/game/{session_id}/exploit/{seat}")
+async def get_exploit_advice(session_id: str, seat: int):
+    """Get exploitative play recommendations for a specific opponent."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    if not session.opponent_model:
+        return {"error": "Personality tracking not available"}
+
+    player_id = session.player_ids.get(seat, f"Player_{seat}")
+    recommendations = session.opponent_model.get_exploit_recommendations(player_id)
+
+    return {
+        "session_id": session_id,
+        "seat": seat,
+        "player_id": player_id,
+        "recommendations": recommendations
+    }
 
 
 def main():
