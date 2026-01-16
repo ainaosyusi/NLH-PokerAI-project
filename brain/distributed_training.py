@@ -60,12 +60,18 @@ try:
     from .population_training import Population, HyperParameters
     from .networks import ActorCriticNetwork
     from .abstraction import create_default_extractor
+    from .visualization import PokerVisualizer, create_visualizer_for_training
 except ImportError:
     from personality_agents import RuleBasedAgent, AgentPool, create_pool
     from multi_player_features import MultiPlayerFeatureExtractor
     from population_training import Population, HyperParameters
     from networks import ActorCriticNetwork
     from abstraction import create_default_extractor
+    try:
+        from visualization import PokerVisualizer, create_visualizer_for_training
+    except ImportError:
+        PokerVisualizer = None
+        create_visualizer_for_training = None
 
 
 # Constants
@@ -83,9 +89,12 @@ class RolloutData:
     values: List[float] = field(default_factory=list)
     log_probs: List[float] = field(default_factory=list)
     player_ids: List[int] = field(default_factory=list)
+    streets: List[int] = field(default_factory=list)  # Street for each action
     total_profit: float = 0.0
     num_hands: int = 0
     worker_id: int = 0
+    # Hand results for visualization
+    hand_results: List[Tuple[int, int, float, bool]] = field(default_factory=list)  # (position, street, profit, won)
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -98,9 +107,11 @@ class RolloutData:
             "values": self.values,
             "log_probs": self.log_probs,
             "player_ids": self.player_ids,
+            "streets": self.streets,
             "total_profit": self.total_profit,
             "num_hands": self.num_hands,
             "worker_id": self.worker_id,
+            "hand_results": self.hand_results,
         }
 
     @classmethod
@@ -115,9 +126,11 @@ class RolloutData:
             values=d["values"],
             log_probs=d["log_probs"],
             player_ids=d.get("player_ids", [0] * len(d["actions"])),
+            streets=d.get("streets", [0] * len(d["actions"])),
             total_profit=d["total_profit"],
             num_hands=d["num_hands"],
             worker_id=d.get("worker_id", 0),
+            hand_results=d.get("hand_results", []),
         )
 
 
@@ -363,9 +376,13 @@ class LocalWorker:
             hand_log_probs = []
             hand_masks = []
             hand_player_ids = []
+            hand_streets = []  # Track street for each action
+            max_street_reached = 0
 
             while not obs["is_terminal"]:
                 current = obs["current_player"]
+                street = obs.get("street", 0)
+                max_street_reached = max(max_street_reached, street)
                 # Get action mask (11 actions for pot-geometric sizing)
                 mask = np.array(obs.get("action_mask", [True] * self.num_actions), dtype=np.float32)
 
@@ -388,6 +405,7 @@ class LocalWorker:
                     hand_log_probs.append(log_prob)
                     hand_masks.append(mask)
                     hand_player_ids.append(current)
+                    hand_streets.append(street)
                 else:
                     # Opponent's turn - use legacy action mask for rule-based agents
                     legacy_mask = np.array(obs.get("legacy_action_mask", [True] * 4), dtype=np.float32)
@@ -406,6 +424,10 @@ class LocalWorker:
                 rollout.total_profit += final_reward
                 rollout.num_hands += 1
 
+                # Record hand result for visualization
+                won = final_reward > 0
+                rollout.hand_results.append((player_id, max_street_reached, final_reward, won))
+
                 # Assign rewards (only final step gets reward)
                 for i in range(len(hand_states)):
                     rollout.states.append(hand_states[i])
@@ -414,6 +436,7 @@ class LocalWorker:
                     rollout.log_probs.append(hand_log_probs[i])
                     rollout.action_masks.append(hand_masks[i])
                     rollout.player_ids.append(hand_player_ids[i])
+                    rollout.streets.append(hand_streets[i])
 
                     if i == len(hand_states) - 1:
                         rollout.rewards.append(final_reward / 100.0)  # Normalize
@@ -537,6 +560,18 @@ class RayPPOTrainer:
         # Logger
         self.logger = TrainingLogger(config)
 
+        # Visualizer
+        self.visualizer = None
+        if PokerVisualizer is not None:
+            self.visualizer = PokerVisualizer(
+                log_dir=config.log_dir,
+                num_players=config.num_players,
+                num_actions=NUM_ACTIONS,
+                use_tensorboard=config.use_tensorboard,
+                save_plots=True,
+                update_freq=config.eval_every,
+            )
+
         # Statistics
         self.total_steps = 0
         self.total_hands = 0
@@ -547,6 +582,7 @@ class RayPPOTrainer:
         print(f"  Using Ray: {self.use_ray}")
         print(f"  Device: {self.device}")
         print(f"  Actions: {NUM_ACTIONS} (pot-geometric)")
+        print(f"  Visualizer: {'Enabled' if self.visualizer else 'Disabled'}")
 
     def _create_workers(self):
         """Create worker instances."""
@@ -831,6 +867,19 @@ class RayPPOTrainer:
                 avg_reward = total_profit / total_hands
                 self.episode_rewards.append(avg_reward)
 
+            # Log to visualizer
+            if self.visualizer:
+                for rollout in rollouts:
+                    # Log actions with street and position info
+                    for action, street, position in zip(
+                        rollout.actions, rollout.streets, rollout.player_ids
+                    ):
+                        self.visualizer.log_action(action, street, position)
+
+                    # Log hand results
+                    for position, street, profit, won in rollout.hand_results:
+                        self.visualizer.log_hand_result(position, street, profit, won)
+
             # Train on collected data
             train_stats = self._train_step(rollouts)
 
@@ -850,6 +899,24 @@ class RayPPOTrainer:
             self.logger.log_scalars(metrics, step=iteration)
             self.logger.increment_step()
 
+            # Log to visualizer
+            if self.visualizer:
+                bb_per_100 = None
+                if (iteration + 1) % self.config.eval_every == 0:
+                    eval_stats = self._evaluate(100)
+                    bb_per_100 = eval_stats.get('eval/bb_per_100')
+
+                self.visualizer.log_training_step(
+                    iteration=iteration,
+                    policy_loss=train_stats.get('policy_loss', 0),
+                    value_loss=train_stats.get('value_loss', 0),
+                    entropy=train_stats.get('entropy', 0),
+                    mean_reward=np.mean(self.episode_rewards) if self.episode_rewards else 0,
+                    hands_played=total_hands,
+                    steps_collected=total_steps,
+                    bb_per_100=bb_per_100,
+                )
+
             # Print progress
             if (iteration + 1) % 10 == 0:
                 elapsed = time.time() - start_time
@@ -862,9 +929,12 @@ class RayPPOTrainer:
                     f"Time: {elapsed:.0f}s"
                 )
 
-            # Evaluation
+            # Evaluation (if not already done for visualizer)
             if (iteration + 1) % self.config.eval_every == 0:
-                eval_stats = self._evaluate(100)
+                if not self.visualizer:  # Only evaluate again if visualizer didn't
+                    eval_stats = self._evaluate(100)
+                else:
+                    eval_stats = self._evaluate(100)
                 self.logger.log_scalars(eval_stats, step=iteration)
                 print(f"  Eval: {eval_stats['eval/bb_per_100']:.2f} BB/100")
 
@@ -907,6 +977,10 @@ class RayPPOTrainer:
 
     def shutdown(self):
         """Shutdown workers and cleanup."""
+        # Close visualizer (generates final plots and reports)
+        if self.visualizer:
+            self.visualizer.close()
+
         self.logger.close()
         if self.use_ray and ray.is_initialized():
             ray.shutdown()
