@@ -1,0 +1,29 @@
+[package]
+name = "poker_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-fast No-Limit Hold'em poker engine with Python bindings"
+license = "MIT"
+
+[lib]
+name = "poker_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
