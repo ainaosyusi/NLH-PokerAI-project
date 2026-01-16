@@ -5,6 +5,7 @@ This module provides:
 2. ELO rating calculation
 3. League tables and rankings
 4. Match history and statistics
+5. Personality analysis integration (Phase 4)
 """
 
 from typing import List, Dict, Optional, Tuple, Callable, Any
@@ -22,12 +23,32 @@ try:
         PersonalityType,
         create_pool,
     )
+    from .personality_analysis import (
+        OpponentModel,
+        HandTracker,
+        AgentAnalyzer,
+        PlayerStatistics,
+        ActionType,
+        Street,
+        action_id_to_type,
+        PersonalityType as AnalysisPersonalityType,
+    )
 except ImportError:
     from personality_agents import (
         RuleBasedAgent,
         AgentPool,
         PersonalityType,
         create_pool,
+    )
+    from personality_analysis import (
+        OpponentModel,
+        HandTracker,
+        AgentAnalyzer,
+        PlayerStatistics,
+        ActionType,
+        Street,
+        action_id_to_type,
+        PersonalityType as AnalysisPersonalityType,
     )
 
 
@@ -228,7 +249,7 @@ class ELOCalculator:
 
 
 class Tournament:
-    """Round-robin tournament system."""
+    """Round-robin tournament system with personality analysis."""
 
     def __init__(
         self,
@@ -236,6 +257,7 @@ class Tournament:
         hands_per_match: int = 500,
         num_rounds: int = 1,
         seed: Optional[int] = None,
+        enable_personality_tracking: bool = True,
     ):
         """Initialize tournament.
 
@@ -244,6 +266,7 @@ class Tournament:
             hands_per_match: Hands to play per match
             num_rounds: Number of round-robin rounds
             seed: Random seed
+            enable_personality_tracking: Enable personality analysis
         """
         self.name = name
         self.hands_per_match = hands_per_match
@@ -255,16 +278,33 @@ class Tournament:
         self.matches: List[MatchResult] = []
         self.elo_calc = ELOCalculator()
 
-    def add_participant(self, agent_id: str, agent: Any, initial_elo: float = 1200.0):
+        # Phase 4: Personality analysis integration
+        self.enable_personality_tracking = enable_personality_tracking
+        self.opponent_model = OpponentModel() if enable_personality_tracking else None
+        self.agent_analyzer = AgentAnalyzer() if enable_personality_tracking else None
+
+    def add_participant(
+        self,
+        agent_id: str,
+        agent: Any,
+        initial_elo: float = 1200.0,
+        agent_type: str = "unknown"
+    ):
         """Add a participant to the tournament.
 
         Args:
             agent_id: Unique identifier
             agent: Agent object (must have get_action method)
             initial_elo: Starting ELO rating
+            agent_type: Type of agent (neural, rule_based, etc.)
         """
         self.participants[agent_id] = agent
         self.stats[agent_id] = AgentStats(agent_id=agent_id, elo_rating=initial_elo)
+
+        # Register with personality analysis system
+        if self.agent_analyzer:
+            profile = self.agent_analyzer.register_agent(agent_id, agent_type)
+            profile.elo_rating = initial_elo
 
     def run(
         self,
@@ -380,13 +420,33 @@ class Tournament:
             Match result
         """
         profits = {0: 0.0, 1: 0.0}
+        player_id_map = {0: agent1_id, 1: agent2_id}
 
         for hand in range(self.hands_per_match):
             obs = env.reset()
 
+            # Initialize hand tracker if personality tracking enabled
+            hand_tracker = None
+            if self.enable_personality_tracking and self.opponent_model:
+                hand_tracker = HandTracker(hand, num_players)
+                hand_tracker.start_hand(
+                    [agent1_id, agent2_id],
+                    [0, 1]  # positions
+                )
+                current_street = Street.PREFLOP
+
             while not obs["is_terminal"]:
                 current = obs["current_player"]
 
+                # Track street changes
+                if hand_tracker:
+                    street_idx = obs.get("street", 0)
+                    new_street = Street(street_idx) if street_idx < 4 else Street.RIVER
+                    if new_street != current_street:
+                        hand_tracker.advance_street(new_street)
+                        current_street = new_street
+
+                # Get action from appropriate agent
                 if current == 0:
                     action = get_action_fn(agent1, obs, env)
                 elif current == 1:
@@ -397,11 +457,48 @@ class Tournament:
                     valid = [i for i, v in enumerate(mask) if v]
                     action = self.rng.choice(valid)
 
+                # Track action for personality analysis
+                if hand_tracker and current in player_id_map:
+                    player_id = player_id_map[current]
+                    is_facing_bet = obs.get("amount_to_call", 0) > 0
+                    action_type = action_id_to_type(action, is_facing_bet)
+                    pot_size = obs.get("pot", 0)
+
+                    hand_tracker.record_action(
+                        player_id,
+                        action_type,
+                        pot_size=pot_size,
+                        is_facing_bet=is_facing_bet,
+                    )
+
                 obs, rewards, done, _, _ = env.step(action)
 
             if done:
                 for i in range(min(2, len(rewards))):
                     profits[i] += rewards[i]
+
+                # Record hand result for personality tracking
+                if hand_tracker and self.opponent_model:
+                    # Determine winner
+                    winner_ids = []
+                    if rewards[0] > 0:
+                        winner_ids.append(agent1_id)
+                    if rewards[1] > 0:
+                        winner_ids.append(agent2_id)
+
+                    hand_profits = {agent1_id: rewards[0], agent2_id: rewards[1]}
+                    went_to_showdown = obs.get("street", 0) >= 3  # River or showdown
+
+                    results = hand_tracker.end_hand(winner_ids, hand_profits, went_to_showdown)
+                    self.opponent_model.record_hand(results)
+
+        # Update agent analyzer with match results
+        if self.agent_analyzer:
+            self.agent_analyzer.update_from_match(
+                [agent1_id, agent2_id],
+                {agent1_id: profits[0], agent2_id: profits[1]},
+                self.hands_per_match
+            )
 
         return MatchResult(
             agent1_id=agent1_id,
@@ -438,9 +535,85 @@ class Tournament:
             "matches": [m.to_dict() for m in self.matches],
         }
 
+        # Include personality analysis if available
+        if self.opponent_model:
+            data["personality_analysis"] = {
+                aid: self.opponent_model.players[aid].to_dict()
+                for aid in self.opponent_model.players
+            }
+
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
+
+    def get_personality_report(self) -> str:
+        """Get personality analysis report for all participants.
+
+        Returns:
+            Formatted text report
+        """
+        if not self.opponent_model:
+            return "Personality tracking not enabled"
+
+        return self.opponent_model.get_summary_report()
+
+    def get_player_hud(self, agent_id: str) -> str:
+        """Get HUD-style statistics for a player.
+
+        Args:
+            agent_id: Player/agent ID
+
+        Returns:
+            HUD display string
+        """
+        if not self.opponent_model:
+            return "Personality tracking not enabled"
+
+        stats = self.opponent_model.get_player_stats(agent_id)
+        if not stats:
+            return f"No data for {agent_id}"
+
+        return stats.get_hud_display()
+
+    def get_exploit_advice(self, agent_id: str) -> Dict[str, str]:
+        """Get exploitative play recommendations for an opponent.
+
+        Args:
+            agent_id: Opponent's agent ID
+
+        Returns:
+            Dictionary of recommendations
+        """
+        if not self.opponent_model:
+            return {"error": "Personality tracking not enabled"}
+
+        return self.opponent_model.get_exploit_recommendations(agent_id)
+
+    def get_agent_comparison(self, agent_ids: Optional[List[str]] = None) -> str:
+        """Get detailed comparison report between agents.
+
+        Args:
+            agent_ids: List of agent IDs to compare (all if None)
+
+        Returns:
+            Formatted comparison report
+        """
+        if not self.agent_analyzer:
+            return "Agent analyzer not enabled"
+
+        ids = agent_ids or list(self.participants.keys())
+        return self.agent_analyzer.generate_comparison_report(ids)
+
+    def get_leaderboard(self) -> List[Dict[str, Any]]:
+        """Get ELO-based leaderboard.
+
+        Returns:
+            Sorted list of agent stats with personality info
+        """
+        if not self.agent_analyzer:
+            return self.get_standings()
+
+        return self.agent_analyzer.get_leaderboard()
 
 
 class League:
@@ -586,7 +759,7 @@ def default_get_action(agent: Any, obs: Dict, env: Any) -> int:
 if __name__ == "__main__":
     import poker_engine
 
-    print("=== Tournament System Test ===\n")
+    print("=== Tournament System Test (with Phase 4 Personality Analysis) ===\n")
 
     # Create environment
     env = poker_engine.PokerEnv(
@@ -596,12 +769,13 @@ if __name__ == "__main__":
         starting_stack=10000,
     )
 
-    # Create tournament
+    # Create tournament with personality tracking enabled
     tournament = Tournament(
         name="Test Tournament",
         hands_per_match=100,
         num_rounds=1,
         seed=42,
+        enable_personality_tracking=True,
     )
 
     # Add participants from different pools
@@ -610,14 +784,15 @@ if __name__ == "__main__":
     rock_agent = RuleBasedAgent(PersonalityType.ROCK, player_id=2, seed=3)
     fish_agent = RuleBasedAgent(PersonalityType.FISH, player_id=3, seed=4)
 
-    tournament.add_participant("TAG_1", tag_agent, initial_elo=1200)
-    tournament.add_participant("LAG_1", lag_agent, initial_elo=1200)
-    tournament.add_participant("ROCK_1", rock_agent, initial_elo=1200)
-    tournament.add_participant("FISH_1", fish_agent, initial_elo=1200)
+    tournament.add_participant("TAG_1", tag_agent, initial_elo=1200, agent_type="rule_based")
+    tournament.add_participant("LAG_1", lag_agent, initial_elo=1200, agent_type="rule_based")
+    tournament.add_participant("ROCK_1", rock_agent, initial_elo=1200, agent_type="rule_based")
+    tournament.add_participant("FISH_1", fish_agent, initial_elo=1200, agent_type="rule_based")
 
     print(f"Tournament: {tournament.name}")
     print(f"Participants: {list(tournament.participants.keys())}")
     print(f"Hands per match: {tournament.hands_per_match}")
+    print(f"Personality Tracking: Enabled")
 
     # Run tournament
     print("\nRunning tournament...")
@@ -638,7 +813,28 @@ if __name__ == "__main__":
             f"BB/100: {standing['bb_per_100']:+.1f}"
         )
 
-    # Save results
+    # Phase 4: Personality Analysis Report
+    print("\n=== Personality Analysis ===")
+    print(tournament.get_personality_report())
+
+    # HUD display for each player
+    print("\n=== HUD Statistics ===")
+    for agent_id in tournament.participants:
+        print(tournament.get_player_hud(agent_id))
+
+    # Exploit recommendations
+    print("\n=== Exploit Recommendations ===")
+    for agent_id in tournament.participants:
+        advice = tournament.get_exploit_advice(agent_id)
+        print(f"\n{agent_id}:")
+        for key, value in advice.items():
+            if key != "status":
+                print(f"  - {key}: {value}")
+
+    # Agent comparison
+    print("\n" + tournament.get_agent_comparison())
+
+    # Save results (now includes personality data)
     tournament.save("/tmp/tournament_test.json")
     print(f"\nResults saved to /tmp/tournament_test.json")
 

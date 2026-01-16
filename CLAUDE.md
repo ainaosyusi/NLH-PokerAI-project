@@ -37,9 +37,11 @@ poker-ai-project/
 │   ├── deep_cfr.py        # Deep CFR algorithm
 │   ├── ppo_agent.py       # PPO self-play agent
 │   ├── personality_agents.py  # Rule-based agents (TAG, LAG, Rock, Fish, Maniac)
+│   ├── personality_analysis.py # HUD stats, opponent modeling, exploit recommendations
 │   ├── population_training.py # Population-based training
-│   ├── tournament.py      # Tournament/league system with ELO
+│   ├── tournament.py      # Tournament/league system with ELO & personality tracking
 │   ├── multi_player_features.py # Multi-player feature extraction
+│   ├── visualization.py   # Training metrics visualization
 │   └── distributed_training.py  # Ray distributed training (optional)
 ├── ui/                    # User interfaces
 │   ├── terminal_ui.py     # Terminal-based UI with Unicode cards

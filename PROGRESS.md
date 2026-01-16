@@ -312,14 +312,153 @@ Recent BB/100: +2.5
 
 ---
 
+## Phase 4: Personality Analysis & Opponent Modeling (COMPLETED)
+
+### Summary
+Comprehensive player statistics tracking, automatic personality classification, and opponent modeling system for exploitative play.
+
+### Features
+
+1. **HUD-Style Player Statistics**
+   - VPIP (Voluntarily Put $ In Pot)
+   - PFR (Pre-Flop Raise)
+   - 3-bet% / Fold to 3-bet
+   - C-bet% / Fold to C-bet
+   - Aggression Factor (AF) & Frequency
+   - WTSD (Went To ShowDown) / W$SD (Won $ at ShowDown)
+   - WWSF (Won When Saw Flop)
+   - BB/100 performance tracking
+   - Position-based statistics
+
+2. **Automatic Personality Classification**
+   - MANIAC: Very loose, very aggressive (VPIP>50%, AF>3)
+   - LAG: Loose-aggressive (VPIP 30-50%, AF>2)
+   - TAG: Tight-aggressive (VPIP 15-30%, AF>2)
+   - ROCK: Very tight, passive (VPIP<15%, AF<1.5)
+   - NIT: Ultra-tight (VPIP<12%)
+   - FISH: Loose, passive (VPIP>40%, AF<1.5)
+   - CALLING_STATION: Calls too much, rarely raises
+   - BALANCED: GTO-ish balanced play
+   - Confidence scoring based on sample size
+
+3. **Opponent Modeling System**
+   - Real-time statistics tracking
+   - Per-player exploit recommendations
+   - Session import/export for persistence
+   - Multi-player comparison
+
+4. **Agent Analyzer**
+   - ELO rating system with head-to-head tracking
+   - Leaderboard generation
+   - Matchup matrix (profit per 100 hands)
+   - Detailed comparison reports
+
+5. **Tournament Integration**
+   - Automatic personality tracking during matches
+   - HUD display for each participant
+   - Exploit advice generation
+   - Enhanced result exports with personality data
+
+### Files Added
+
+**`brain/personality_analysis.py`** (~800 lines)
+- `PlayerStatistics` - HUD-style statistics tracking
+- `HandResult` / `HandAction` - Hand recording dataclasses
+- `OpponentModel` - Real-time opponent tracking
+- `HandTracker` - Utility for game loop integration
+- `AgentAnalyzer` - Agent comparison and ELO tracking
+- `AgentProfile` - Extended agent profile with personality
+- Automatic personality classification based on observed stats
+- Exploit recommendation generator
+
+### Files Modified
+
+**`brain/tournament.py`**
+- Added personality analysis imports
+- `Tournament` class now tracks personality during matches
+- Added `get_personality_report()` method
+- Added `get_player_hud()` method
+- Added `get_exploit_advice()` method
+- Added `get_agent_comparison()` method
+- Enhanced `save()` to include personality data
+- Integrated `OpponentModel` and `AgentAnalyzer`
+
+### Usage
+
+```python
+from brain.personality_analysis import OpponentModel, HandTracker, AgentAnalyzer
+
+# Real-time opponent modeling
+model = OpponentModel()
+# ... track hands during play ...
+print(model.get_summary_report())
+
+# Get HUD stats for a player
+stats = model.get_player_stats("Player_1")
+print(stats.get_hud_display())
+# Output: [Player_1] VPIP:25% PFR:18% AF:2.5 3B:8% CB:70% WTSD:35% (500h)
+
+# Get exploit recommendations
+recs = model.get_exploit_recommendations("Player_1")
+# Returns: {"value_betting": "...", "bluffing": "...", ...}
+
+# Agent comparison
+analyzer = AgentAnalyzer()
+analyzer.register_agent("Neural_v1", "neural")
+analyzer.register_agent("TAG_Bot", "rule_based")
+# ... run matches ...
+print(analyzer.get_leaderboard())
+print(analyzer.generate_comparison_report(["Neural_v1", "TAG_Bot"]))
+```
+
+### Tournament with Personality Tracking
+
+```python
+from brain.tournament import Tournament
+
+tournament = Tournament(
+    name="Championship",
+    hands_per_match=500,
+    enable_personality_tracking=True,  # Enable Phase 4 features
+)
+
+# Add participants
+tournament.add_participant("TAG_Bot", tag_agent, agent_type="rule_based")
+tournament.add_participant("Neural_v1", neural_agent, agent_type="neural")
+
+# Run tournament
+tournament.run(env, get_action_fn)
+
+# Get analysis
+print(tournament.get_personality_report())
+print(tournament.get_player_hud("TAG_Bot"))
+print(tournament.get_exploit_advice("Neural_v1"))
+print(tournament.get_agent_comparison())
+```
+
+### Sample Output
+
+```
+[TAG_Bot] VPIP:22% PFR:18% AF:2.8 3B:9% CB:72% WTSD:32% (500h)
+  Personality: tag (100% confidence)
+  Profit: +1250 chips (+12.5 BB/100)
+
+Exploit Recommendations for FISH_Player:
+  - value_betting: Bet larger for value - this player calls too much
+  - bluffing: Reduce bluff frequency - this player rarely folds
+  - hand_selection: Play more hands in position - they'll pay off your value
+```
+
+---
+
 ## Next Steps
 
-### Phase 4: Personality Quantification & League System
-- [ ] Player personality profiling (VPIP, PFR, AF)
-- [ ] ELO rating system improvements
-- [ ] Tournament simulation
-- [ ] Agent comparison tools
-- [ ] Opponent modeling integration
+### Phase 5: Advanced Features (TODO)
+- [ ] Neural network opponent modeling
+- [ ] GTO vs Exploitative mode switching
+- [ ] Hand range visualization
+- [ ] ICM calculations for tournaments
+- [ ] Multi-table tournament support
 
 ---
 
