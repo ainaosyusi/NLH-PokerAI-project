@@ -102,10 +102,10 @@ python -c "import poker_engine; print(poker_engine.benchmark_random_hands(100000
 
 ## Architecture Notes
 
-- **Phase 1**: Rust game engine with PyO3 Python bindings
-- **Phase 2**: Deep CFR and PPO training algorithms
-- **Phase 3**: Multi-player support, personality pools, PBT, tournaments
-- **Phase 4**: Terminal and Web UI for human play
+- **Phase 1**: Rust game engine with PyO3 Python bindings, pot-geometric action system (11 actions)
+- **Phase 2**: Deep CFR and PPO training algorithms, Ray distributed training
+- **Phase 3**: Multi-player support, personality pools, PBT, tournaments, visualization
+- **Phase 4**: Personality analysis, opponent modeling, HUD statistics, Web UI with real-time tracking
 
 ## Important Files
 
@@ -114,9 +114,42 @@ python -c "import poker_engine; print(poker_engine.benchmark_random_hands(100000
 | `core_engine/src/game.rs` | Core game logic, state machine |
 | `core_engine/src/evaluator.rs` | Hand evaluation tables |
 | `brain/personality_agents.py` | AI opponent personalities |
+| `brain/personality_analysis.py` | HUD stats, opponent modeling, exploit recommendations |
 | `brain/ppo_agent.py` | PPO training implementation |
+| `brain/tournament.py` | Tournament system with ELO & personality tracking |
+| `brain/visualization.py` | Training metrics & action distribution visualization |
+| `ui/web_server.py` | FastAPI web UI with HUD display |
 | `ui/game_controller.py` | Human vs AI game loop |
 | `play_poker.py` | Main entry point |
+
+## Phase 4: Personality Analysis
+
+### HUD Statistics
+- **VPIP**: Voluntarily Put $ In Pot
+- **PFR**: Pre-Flop Raise %
+- **AF**: Aggression Factor (bets+raises / calls)
+- **3-bet%**: Three-bet frequency
+- **C-bet%**: Continuation bet frequency
+- **WTSD**: Went To ShowDown %
+- **W$SD**: Won $ at ShowDown %
+
+### Personality Types
+- MANIAC, LAG, TAG, ROCK, NIT, FISH, CALLING_STATION, BALANCED
+
+### Usage
+```python
+from brain.personality_analysis import OpponentModel
+
+model = OpponentModel()
+# Track hands during play...
+print(model.get_summary_report())
+
+# Get exploit recommendations
+recs = model.get_exploit_recommendations("Player_1")
+```
+
+### Web UI HUD
+The Web UI displays real-time HUD statistics for each AI opponent during play.
 
 ## Dependencies
 
